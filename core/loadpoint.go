@@ -1084,7 +1084,7 @@ func (lp *Loadpoint) fastCharging() error {
 }
 
 // pvScalePhases switches phases if necessary and returns number of phases switched to
-func (lp *Loadpoint) pvScalePhases(sitePower, minCurrent, maxCurrent float64) int {
+func (lp *Loadpoint) pvScalePhases(sitePower, gridPower, minCurrent, maxCurrent float64, batterybuffered bool) int {
 	phases := lp.GetPhases()
 
 	// observed phase state inconsistency
@@ -1105,28 +1105,35 @@ func (lp *Loadpoint) pvScalePhases(sitePower, minCurrent, maxCurrent float64) in
 	scalable := (sitePower > 0 || !lp.enabled) && activePhases > 1 && lp.configuredPhases < 3
 
 	// scale down phases
+
 	if targetCurrent := powerToCurrent(availablePower, activePhases); targetCurrent < minCurrent && scalable {
-		lp.log.DEBUG.Printf("available power %.0fW < %.0fW min %dp threshold", availablePower, float64(activePhases)*Voltage*minCurrent, activePhases)
+		lp.log.DEBUG.Printf("available power %.0fW < %.0fW min %dp threshold, butterybuffered %b gridPower %.0f, Threshold %.0f", availablePower, float64(activePhases)*Voltage*minCurrent, activePhases, batterybuffered, gridPower, lp.Disable.Threshold)
 
-		if !lp.charging() { // scale immediately if not charging
-			lp.phaseTimer = elapsed
-		}
+		if batterybuffered && (gridPower < lp.GetDisableThreshold()) {
+			//Skip scale down 3p->1p in case batterybuffered mode and still Grid usage below Threshold
+			lp.log.DEBUG.Println("No scale down due to Battery buffered and GridPower %.0f < Threshold %.0f", gridPower, lp.GetDisableThreshold())
+		} else {
 
-		if lp.phaseTimer.IsZero() {
-			lp.log.DEBUG.Printf("start phase %s timer", phaseScale1p)
-			lp.phaseTimer = lp.clock.Now()
-		}
-
-		lp.publishTimer(phaseTimer, lp.Disable.Delay, phaseScale1p)
-
-		if elapsed := lp.clock.Since(lp.phaseTimer); elapsed >= lp.Disable.Delay {
-			if err := lp.scalePhases(1); err != nil {
-				lp.log.ERROR.Println(err)
+			if !lp.charging() { // scale immediately if not charging
+				lp.phaseTimer = elapsed
 			}
-			return 1
-		}
 
-		waiting = true
+			if lp.phaseTimer.IsZero() {
+				lp.log.DEBUG.Printf("start phase %s timer", phaseScale1p)
+				lp.phaseTimer = lp.clock.Now()
+			}
+
+			lp.publishTimer(phaseTimer, lp.Disable.Delay, phaseScale1p)
+
+			if elapsed := lp.clock.Since(lp.phaseTimer); elapsed >= lp.Disable.Delay {
+				if err := lp.scalePhases(1); err != nil {
+					lp.log.ERROR.Println(err)
+				}
+				return 1
+			}
+
+			waiting = true
+		}
 	}
 
 	maxPhases := lp.maxActivePhases()
@@ -1192,7 +1199,7 @@ func (lp *Loadpoint) publishTimer(name string, delay time.Duration, action strin
 }
 
 // pvMaxCurrent calculates the maximum target current for PV mode
-func (lp *Loadpoint) pvMaxCurrent(mode api.ChargeMode, sitePower float64, batteryBuffered, batteryStart bool) float64 {
+func (lp *Loadpoint) pvMaxCurrent(mode api.ChargeMode, sitePower float64, gridPower float64, batteryBuffered, batteryStart bool) float64 {
 	// read only once to simplify testing
 	minCurrent := lp.effectiveMinCurrent()
 	maxCurrent := lp.effectiveMaxCurrent()
@@ -1200,7 +1207,7 @@ func (lp *Loadpoint) pvMaxCurrent(mode api.ChargeMode, sitePower float64, batter
 	// switch phases up/down
 	var scaledTo int
 	if lp.hasPhaseSwitching() && lp.phaseSwitchCompleted() {
-		scaledTo = lp.pvScalePhases(sitePower, minCurrent, maxCurrent)
+		scaledTo = lp.pvScalePhases(sitePower, gridPower, minCurrent, maxCurrent, batteryBuffered)
 	}
 
 	// calculate target charge current from delta power and actual current
@@ -1566,7 +1573,7 @@ func (lp *Loadpoint) phaseSwitchCompleted() bool {
 }
 
 // Update is the main control function. It reevaluates meters and charger state
-func (lp *Loadpoint) Update(sitePower float64, autoCharge, batteryBuffered, batteryStart bool, greenShare float64, effPrice, effCo2 *float64) {
+func (lp *Loadpoint) Update(sitePower float64, gridPower float64, autoCharge, batteryBuffered, batteryStart bool, greenShare float64, effPrice, effCo2 *float64) {
 	lp.publish(keys.SmartCostActive, autoCharge)
 	lp.processTasks()
 
@@ -1670,7 +1677,7 @@ func (lp *Loadpoint) Update(sitePower float64, autoCharge, batteryBuffered, batt
 			break
 		}
 
-		targetCurrent := lp.pvMaxCurrent(mode, sitePower, batteryBuffered, batteryStart)
+		targetCurrent := lp.pvMaxCurrent(mode, sitePower, gridPower, batteryBuffered, batteryStart)
 
 		if targetCurrent == 0 && lp.vehicleClimateActive() {
 			targetCurrent = lp.effectiveMinCurrent()
